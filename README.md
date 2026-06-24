@@ -33,7 +33,7 @@ Les anàlisis s'han dut a terme amb:
 **Anna Guinovart**
 
 Grau en Estadística  
-Universitat de Barcelona (UB) – Universitat Politècnica de Catalunya (UPC)
+Universitat de Barcelona (UB) - Universitat Politècnica de Catalunya (UPC)
 
 ## Finalitat del repositori
 
