@@ -38,6 +38,3 @@ Les anàlisis s'han dut a terme amb:
 Grau en Estadística  
 Universitat de Barcelona (UB) - Universitat Politècnica de Catalunya (UPC)
 
-## Finalitat del repositori
-
-Aquest repositori es posa a disposició amb finalitats acadèmiques i de reproduïbilitat. El codi inclòs correspon a les anàlisis desenvolupades en el Treball de Fi de Grau.
