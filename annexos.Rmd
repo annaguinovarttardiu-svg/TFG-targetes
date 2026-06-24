@@ -1,0 +1,1305 @@
+---
+title: "Annexos"
+author: "Anna Guinovart"
+date: "2026-06-03"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rvest)
+library(dplyr)
+library(httr)
+library(stringr)
+library(jsonlite)
+library(purrr)
+library(tibble)
+library(tidyr)
+library(scales)
+library(vcd)
+library(lme4)
+library(lmtest)
+library(emmeans)
+library(caret)
+library(influence.ME)
+library(DHARMa)
+library(knitr)
+```
+
+# METODOLOGIA
+
+## Obtenció de les dades
+
+### Extreure links dels partits
+
+A partir del següent link amb el calendari dels 380 partits de la temporada 24-25, S'inspecciona la pàgina web i es busca l'endpoint amb tota la info del calendari (https://assets.laliga.com/assets/calendar/calendar-100-1.json extret de https://www.laliga.com/calendario-2024-2025/laliga-easports). Aquest serà un fitxer json que ens permetrar crear els 380 url necessaris.
+
+Amb el link https://www.laliga.com/calendario-2023-2024/laliga-easports es troba el fitxer json per a la temporada 23-24.
+
+Es construeix la funció:
+```{r}
+construir_url_calendari <- function(
+  season = "2024-2025",
+  competition_slug = "laliga-ea-sports",
+  calendar_url = "https://assets.laliga.com/assets/calendar/calendar-100-1.json"
+) {
+  resp <- GET(calendar_url, user_agent("Mozilla/5.0"))
+  stop_for_status(resp)
+  txt <- content(resp, "text", encoding = "UTF-8")
+  j <- fromJSON(txt, simplifyVector = FALSE)
+
+  # s'ordenen les jornades
+  jornada_keys <- names(j)
+  jornada_keys <- jornada_keys[order(as.integer(jornada_keys))]
+
+  df <- map_dfr(jornada_keys, function(k) {
+    node <- j[[k]]
+    matches <- node$matches
+
+    map_dfr(matches, ~ tibble(
+      jornada    = as.integer(k),
+      match_id   = .x$match_id,
+      local_name = .x$local_name,
+      local_slug = .x$local_slug,
+      away_name  = .x$away_name,
+      away_slug  = .x$away_slug
+    ))
+  }) %>%
+    group_by(jornada) %>%
+    ungroup() %>%
+    mutate(
+      url = sprintf(
+        "https://www.laliga.com/partido/temporada-%s-%s-%s-%s-%s",
+        season, competition_slug, local_slug, away_slug, jornada
+      )
+    ) %>%
+    select(jornada, match_id,
+           local_name, away_name, local_slug, away_slug, url)
+
+  df
+}
+```
+
+```{r}
+# URL dels partits de la temporada 23-24
+table_partitinfo_urls_2324 <- construir_url_calendari(season = "2023-2024" , calendar_url = "https://assets.laliga.com/assets/calendar/calendar-99-1.json")
+# URL dels partits de la temporada 24-25
+table_partitinfo_urls_2425 <- construir_url_calendari()
+```
+
+```{r}
+# els slugs del osasuna, del valladolid i del alaves son incorrectes (si es posa el url al buscador donaria error), per tant, es canvien manualment en les 2 temporades:
+
+# 23-24
+table_partitinfo_urls_2324 <- table_partitinfo_urls_2324 %>%
+  mutate(
+    local_slug = case_when(
+      local_slug == "c-a-osasuna" ~ "ca-osasuna",
+      local_slug == "r-valladolid-cf" ~ "real-valladolid-cf",
+      local_slug == "d-alaves" ~ "deportivo-alaves",
+      TRUE ~ local_slug
+    ),
+    away_slug = case_when(
+      away_slug == "c-a-osasuna" ~ "ca-osasuna",
+      away_slug == "r-valladolid-cf" ~ "real-valladolid-cf",
+      away_slug == "d-alaves" ~ "deportivo-alaves",
+      TRUE ~ away_slug
+    )
+  ) %>%
+  mutate(
+    url = sprintf(
+      "https://www.laliga.com/partido/temporada-2023-2024-laliga-easports-%s-%s-%s",
+      local_slug, away_slug, jornada
+    )
+  )
+
+urls_2324 <- table_partitinfo_urls_2324[,"url"]
+
+# 24-25
+table_partitinfo_urls_2425 <- table_partitinfo_urls_2425 %>%
+  mutate(
+    local_slug = case_when(
+      local_slug == "c-a-osasuna" ~ "ca-osasuna",
+      local_slug == "r-valladolid-cf" ~ "real-valladolid-cf",
+      local_slug == "d-alaves" ~ "deportivo-alaves",
+      TRUE ~ local_slug
+    ),
+    away_slug = case_when(
+      away_slug == "c-a-osasuna" ~ "ca-osasuna",
+      away_slug == "r-valladolid-cf" ~ "real-valladolid-cf",
+      away_slug == "d-alaves" ~ "deportivo-alaves",
+      TRUE ~ away_slug
+    )
+  ) %>%
+  mutate(
+    url = sprintf(
+      "https://www.laliga.com/partido/temporada-2024-2025-laliga-ea-sports-%s-%s-%s",
+      local_slug, away_slug, jornada
+    )
+  )
+
+urls_2425 <- table_partitinfo_urls_2425[,"url"]
+head(table_partitinfo_urls_2425)
+```
+
+### Extreure targetes de tota una temporada
+
+```{r}
+# 1- Targetes d'un partit
+scrape_cards_one_partit <- function(url) {
+  # Petició
+  resp <- try(
+    GET(
+      url,
+      user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+    ),
+    silent = TRUE
+  )
+  if (inherits(resp, "try-error") || http_error(resp)) {
+    return(tibble())
+  }
+
+  # HTML -> rvest
+  html_text <- content(resp, "text", encoding = "UTF-8")
+  res <- read_html(html_text)
+  
+  node_resultat <- res %>%
+  html_element(xpath = "//div[contains(@class,'VsTeamStats')]")
+
+  resultat_final <- if (!is.na(node_resultat)) {
+    parts <- node_resultat %>%
+      html_elements("p") %>%
+      html_text(trim = TRUE)
+
+    # parts sol ser c("0", "-", "4") o c("0","vs","4")
+    # ens quedem només amb números i separadors típics, i unim
+    parts <- parts[parts != ""]
+    if (length(parts) >= 2) {
+      s <- paste(parts, collapse = " ")
+      # normalitza "0 vs 4" -> "0 - 4"
+      s <- str_replace_all(s, "\\bvs\\b", "-")
+      s <- str_replace_all(s, "\\s*\\-\\s*", " - ")
+      str_squish(s)
+   } else {
+      NA_character_
+   }
+  } else {
+  NA_character_
+  }
+
+  # Events feed
+  selec <- res %>% html_elements("div")
+
+  tevents <- selec %>%
+    html_elements(".styled__CommentTime-sc-evx07m-2") %>%
+    html_text()
+
+  events <- selec %>%
+    html_elements(".styled__CommentContent-sc-evx07m-4") %>%
+    html_text()
+
+  # Si no hi ha feed, retornem buit
+  if (length(tevents) == 0 || length(events) == 0) {
+    return(tibble())
+  }
+
+  # minuts:
+  tevents <- suppressWarnings(as.integer(str_replace(tevents, "'$", "")))
+
+  aa <- tibble(time = tevents, event = as.character(events))
+
+  # Àrbitre
+  arbitre <- res %>%
+    html_elements("i.icon-match-referee") %>%
+    html_element(xpath = "..") %>%
+    html_elements("p") %>%
+    html_text(trim = TRUE) %>%
+    .[1]
+  if (length(arbitre) == 0) arbitre <- NA_character_
+
+  # Jornada (últim número del URL)
+  jornada <- suppressWarnings(as.integer(str_extract(url, "(?<=-)\\d+$")))
+
+  # Targetes
+  cards_tbl <- aa %>%
+    mutate(
+      event = str_squish(event),
+      time  = suppressWarnings(as.integer(time))
+    ) %>%
+   filter(
+      str_detect(str_to_lower(event), "tarjeta|targeta"),        # només targetes
+      !str_detect(event, "^Decisión del VAR:")                   # excloure VAR
+    ) %>%
+    transmute(
+      url = url,
+      jornada = jornada,
+      resultat_final = resultat_final,
+      minut = time,
+      cat_minut = case_when(
+        time <= 45 ~ "primera_part",
+        time > 45  ~ "segona_part"
+        ),
+      jugador = str_trim(str_extract(event, "^[^\\(]+")),
+      equip = str_match(event, "\\(([^\\)]+)\\)")[, 2],
+      tipus_targeta = case_when(
+        str_detect(str_to_lower(event), "segunda tarjeta amarilla") ~ "segona_groga",
+        str_detect(str_to_lower(event), "tarjeta amarilla") ~ "groga",
+        str_detect(str_to_lower(event), "tarjeta roja")     ~ "vermella",
+        TRUE                                                ~ "targeta (altre)"
+    ),
+    arbitre = arbitre
+  ) %>%
+  arrange(minut)
+
+  cards_tbl
+}
+
+# 2- 380 partits -> totes les targetes
+scrape_cards_temporada <- function(urls, sleep_sec = 1) {
+  # opcional: progress
+  out <- map_dfr(urls, function(u) {
+    Sys.sleep(sleep_sec)
+    tryCatch(
+      scrape_cards_one_partit(u),
+      error = function(e) tibble()
+    )
+  })
+
+  out
+}
+```
+
+```{r}
+# Per a cada temporada:
+cards_2324 <- scrape_cards_temporada(table_partitinfo_urls_2324$url, sleep_sec = 1)
+cards_2425 <- scrape_cards_temporada(table_partitinfo_urls_2425$url, sleep_sec = 1)
+head(cards_2425)
+```
+
+
+Modificacions:
+```{r}
+# s'afegeix local/visitant
+cards_2324 <- cards_2324 %>%
+  left_join(
+    table_partitinfo_urls_2324 %>% 
+      select(url, local_name, away_name),
+    by = "url"
+  )
+
+# normalitzacio de nom
+cards_2324 <- cards_2324 %>%
+  mutate(
+    local_name = local_name %>%
+      str_remove("^(UD|CF|RC|FC|RCD|CA)\\s+") %>%
+      str_remove("\\s+(UD|CF|RC|FC|RCD|ca)$") %>%
+      str_replace("^Celta$", "Celta de Vigo") %>%
+      str_replace("^Espanyol de Barcelona$", "Espanyol"),
+    
+    away_name = away_name %>%
+      str_remove("^(UD|CF|RC|FC|RCD|CA)\\s+") %>%
+      str_remove("\\s+(UD|CF|RC|FC|RCD|CA)$") %>%
+      str_replace("^Celta$", "Celta de Vigo") %>%
+      str_replace("^Espanyol de Barcelona$", "Espanyol")
+  )
+
+# local visitant
+cards_2324 <- cards_2324 %>%
+  mutate(
+    local_visitant = case_when(
+      equip == local_name ~ "local",
+      equip == away_name  ~ "visitant"
+    )
+  ) 
+
+# es crea el camp de l'equip rebut
+cards_2324 <- cards_2324 %>%
+  mutate(
+    equip_rebut = case_when(
+      local_visitant == "local" ~ away_name,
+      local_visitant == "visitant" ~ local_name
+    )
+  )
+
+# la variable del resultat es desglossa en el nombre de gols de cada equip
+cards_2324 <- cards_2324 %>%
+  separate(resultat_final, into = c("gols_local", "gols_visitant"), sep = " - ", convert = TRUE)
+
+# es crea una variable categorica amb el resultat per a l'equip sancionat
+cards_2324$resultat_equip <- ifelse(  
+  (cards_2324$local_visitant == "local" & cards_2324$gols_local > cards_2324$gols_visitant) |  
+  (cards_2324$local_visitant == "visitant" & cards_2324$gols_visitant > cards_2324$gols_local),  
+  "victoria",  
+  ifelse(cards_2324$gols_local == cards_2324$gols_visitant, "empat", "derrota")  
+)
+
+# variable amb els gols totals
+cards_2324 <- cards_2324 %>%
+  mutate(gols_total = gols_local + gols_visitant)
+
+cards_2324 <- cards_2324 %>%
+  select(-c(local_name, away_name))
+```
+
+el mateix per al 24-25
+```{r}
+cards_2425 <- cards_2425 %>%
+  left_join(
+    table_partitinfo_urls_2425 %>% 
+      select(url, local_name, away_name),
+    by = "url"
+  )
+
+cards_2425 <- cards_2425 %>%
+  mutate(
+    local_name = local_name %>%
+      str_remove("^(UD|CF|RC|FC|RCD|CA)\\s+") %>%
+      str_remove("\\s+(UD|CF|RC|FC|RCD|ca)$") %>% 
+      str_replace("^Celta$", "Celta de Vigo") %>%
+      str_replace("^Espanyol de Barcelona$", "Espanyol"),
+    
+    away_name = away_name %>%
+      str_remove("^(UD|CF|RC|FC|RCD|CA)\\s+") %>%
+      str_remove("\\s+(UD|CF|RC|FC|RCD|CA)$") %>%
+      str_replace("^Celta$", "Celta de Vigo") %>%
+      str_replace("^Espanyol de Barcelona$", "Espanyol")
+  )
+
+cards_2425 <- cards_2425 %>%
+  mutate(
+    local_visitant = case_when(
+      equip == local_name ~ "local",
+      equip == away_name  ~ "visitant"
+    )
+  ) 
+
+cards_2425 <- cards_2425 %>%
+  mutate(
+    equip_rebut = case_when(
+      local_visitant == "local" ~ away_name,
+      local_visitant == "visitant" ~ local_name
+    )
+  )
+
+# la variable del resultat es desglossa en el nombre de gols de cada equip
+cards_2425 <- cards_2425 %>%
+  separate(resultat_final, into = c("gols_local", "gols_visitant"), sep = " - ", convert = TRUE)
+
+# es crea una variable categorica amb el resultat per a l'equip sancionat
+cards_2425$resultat_equip <- ifelse(  
+  (cards_2425$local_visitant == "local" & cards_2425$gols_local > cards_2425$gols_visitant) |  
+  (cards_2425$local_visitant == "visitant" & cards_2425$gols_visitant > cards_2425$gols_local),  
+  "victoria",  
+  ifelse(cards_2425$gols_local == cards_2425$gols_visitant, "empat", "derrota")  
+)
+
+# variable amb els gols totals
+cards_2425 <- cards_2425 %>%
+  mutate(gols_total = gols_local + gols_visitant)
+
+cards_2425 <- cards_2425 %>%
+  select(-c(local_name, away_name))
+```
+
+es guarden el fitxer de cada temporada
+```{r}
+write.csv(cards_2324, "cards2324.csv", row.names = FALSE)
+write.csv(cards_2425, "cards2425.csv", row.names = FALSE)
+```
+
+Es crea un gran fitxer amb totes les targetes de les dues temporades
+```{r}
+cards_all <- rbind(cards_2324, cards_2425)
+```
+
+Es decideix anonimitzar els noms dels arbitres
+```{r}
+arbitres<-unique(cards_all$arbitre)
+sort(arbitres)
+```
+
+Es canvia el nom de l'arbitre pel codi, el qual seran les seves inicials.
+```{r}
+tabla_arbitres <- tibble(arbitre = sort(unique(cards_all$arbitre))) %>%
+  mutate(
+    # funcio per codificar el nom dels arbitres
+    codi_arbitre = arbitre %>%
+      str_split(" ") %>%
+      sapply(function(x) paste0(substr(x, 1, 1), collapse = ""))
+  )
+
+cards_all <- cards_all %>%
+  left_join(tabla_arbitres, by = "arbitre")
+cards_all$arbitre <- NULL
+```
+
+Guardar el fitxer creat.
+```{r}
+write.csv(cards_all, "cards_all.csv", row.names = FALSE)
+```
+
+
+# ANÀLISI UNIVARIANT
+
+```{r}
+str(cards_all)
+```
+
+```{r}
+cards_all$cat_minut <- as.factor(cards_all$cat_minut)
+cards_all$equip <- as.factor(cards_all$equip)
+cards_all$equip_rebut <- as.factor(cards_all$equip_rebut)
+cards_all$tipus_targeta <- as.factor(cards_all$tipus_targeta)
+cards_all$local_visitant <- as.factor(cards_all$local_visitant)
+cards_all$codi_arbitre <- as.factor(cards_all$codi_arbitre)
+cards_all$resultat_equip <- as.factor(cards_all$resultat_equip)
+```
+
+## Jornada
+
+```{r}
+ggplot(cards_all, aes(x = jornada)) +
+  geom_bar() +
+  labs(title = "Targetes per jornada", x = "Jornada", y = "Nombre de targetes")
+```
+
+## Nombre de gols
+
+```{r}
+partits_targ <- cards_all %>%
+  group_by(url, gols_total) %>%
+  summarise(n_targetes = n(), .groups = "drop")
+```
+
+```{r}
+ggplot(partits_targ, aes(x = factor(gols_total), y = n_targetes)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(
+    title = "Nombre de targetes per partit segons gols",
+    x = "Gols en el partit",
+    y = "Nombre de targetes per partit"
+  ) +
+  theme_minimal()
+```
+
+## Minut
+
+```{r}
+ggplot(cards_all, aes(x = minut)) +
+  geom_histogram(binwidth = 5) +
+  labs(title = "Distribució del minut de les targetes", x = "Minut", y = "Freqüència")
+```
+
+## Categoria del minut
+
+```{r}
+ggplot(cards_all, aes(x = cat_minut)) +
+  geom_bar() +
+  labs(title = "Distribució de targetes segons la part",  x = "Part del partit",  y = "Nombre de targetes")
+```
+
+## Jugador
+
+S'ha de fer amb les dues temporades per separat.
+```{r}
+cards_2324 |>
+  count(jugador, sort = TRUE) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = reorder(jugador, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Jugadors amb més targetes - Temporada 23/24", x = "Jugador", y = "Nombre de targetes")
+
+cards_2425 |>
+  count(jugador, sort = TRUE) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = reorder(jugador, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Jugadors amb més targetes - Temporada 24/25", x = "Jugador", y = "Nombre de targetes")
+```
+
+## Equip
+
+```{r}
+cards_all %>%
+  group_by(equip) %>%
+  summarise(
+    targetes_partit = n_distinct(url),  # nombre de partits
+    total_targetes = n(),               # total targetes
+    taxa_targetes = total_targetes / targetes_partit,
+    .groups = "drop"
+  ) %>%
+  arrange(taxa_targetes) %>%
+  mutate(equip = factor(equip, levels = equip)) %>%
+  
+  ggplot(aes(x = equip, y = taxa_targetes)) +
+  geom_col(fill = "grey40") +
+  coord_flip() +
+  labs(title = "Taxa de targetes per partit segons equip", x = "Equip", y = "Targetes per partit") 
+```
+
+## Tipologia de la targeta
+
+```{r}
+prop.table(table(cards_all$tipus_targeta))
+```
+
+## Àrbitre
+
+```{r}
+# Nombre de targetes per arbitre
+cards_per_ref <- cards_all %>%
+  group_by(codi_arbitre) %>%
+  summarise(total_targetes = n())
+
+# Nombre de partits per arbitre
+partits_per_ref <- cards_all %>%
+  select(codi_arbitre, url) %>%
+  distinct() %>%   # cada partit només un cop
+  group_by(codi_arbitre) %>%
+  summarise(total_partits = n())
+
+ref_summary <- cards_per_ref %>%
+  left_join(partits_per_ref, by = "codi_arbitre") %>%
+  mutate(taxa_targetes = total_targetes / total_partits)
+```
+
+```{r}
+ggplot(ref_summary, aes(x = reorder(codi_arbitre, taxa_targetes), y = taxa_targetes)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Taxa de targetes per partit segons àrbitre", x = "Àrbitre", y = "Targetes per partit")
+```
+
+## Local/visitant
+
+```{r}
+ggplot(cards_all, aes(x = local_visitant)) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Proporció de targetes: local vs visitant", x = "Local vs visitant", y = "Percentatge") 
+```
+
+## Resultat
+
+```{r}
+cards_all %>%
+  group_by(resultat_equip) %>%
+  summarise(
+    targetes = n(),
+    partits = n_distinct(url),
+    targetes_per_partit = targetes / partits
+  )
+```
+
+
+## Equip receptor
+
+```{r}
+cards_all %>%
+  group_by(equip_rebut) %>%
+  summarise(
+    targetes_partit = n_distinct(url),  # nombre de partits
+    total_targetes = n(),               # total targetes
+    taxa_targetes = total_targetes / targetes_partit,
+    .groups = "drop"
+  ) %>%
+  arrange(taxa_targetes) %>%
+  mutate(equip_rebut = factor(equip_rebut, levels = equip_rebut)) %>%
+  
+  ggplot(aes(x = equip_rebut, y = taxa_targetes)) +
+  geom_col(fill = "grey40") +
+  coord_flip() +
+  labs(title = "Taxa de targetes per partit segons equip rebut", x = "Equip rebut", y = "Targetes per partit") 
+```
+
+
+# ANÀLISI BIVARIANT
+
+## Tipologia de targeta i categoria del minut
+
+```{r}
+(tab_tipusfalta_catmin <- table(cards_all$tipus_targeta, cards_all$cat_minut))
+chisq.test(tab_tipusfalta_catmin)
+```
+
+```{r}
+ggplot(cards_all, aes(x = cat_minut, fill = tipus_targeta)) +
+  geom_bar(position = "fill") + 
+  scale_fill_manual(
+    values = c(
+      "groga" = "#6495ED",         
+      "segona_groga" = "#32CD32", 
+      "vermella" = "#F08080"     
+    )
+  ) +
+  labs(x = "Part del partit", y = "Proporció", fill = "Tipus de targeta") 
+```
+
+## Tipologia de targeta i resultat
+
+```{r}
+(tab_tipusfalta_resfinal <- table(cards_all$tipus_targeta, cards_all$resultat_equip))
+chisq.test(tab_tipusfalta_resfinal)
+```
+
+```{r}
+ggplot(cards_all, aes(x = resultat_equip, fill = tipus_targeta)) +
+  geom_bar(position = "fill") +
+  labs(x = "Resultat de l'equip", y = "Proporció", fill = "Tipus de targeta"
+  ) +
+    scale_fill_manual(
+    values = c(
+      "groga" = "#6495ED",         
+      "segona_groga" = "#32CD32", 
+      "vermella" = "#F08080"     
+    )
+  )
+```
+
+V de Cramer:
+```{r}
+assocstats(tab_tipusfalta_resfinal)
+```
+
+## Tipologia de targeta i equip
+
+```{r}
+cards_all %>%
+  group_by(equip, tipus_targeta) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(equip) %>%
+  mutate(Proporció = n / sum(n)) %>%
+  ggplot(aes(x = equip, y = Proporció, fill = tipus_targeta)) +
+  geom_bar(stat = "identity") +
+    scale_fill_manual(
+    values = c(
+      "groga" = "#6495ED",         
+      "segona_groga" = "#32CD32", 
+      "vermella" = "#F08080"     
+    ) 
+  ) +
+  coord_flip()
+```
+
+```{r}
+tab_tipustargeta_equip <- table(cards_all$equip, cards_all$tipus_targeta)
+chisq.test(tab_tipustargeta_equip)
+```
+
+Reducció dimensionalitat:
+```{r}
+cards_all <- cards_all %>%
+  mutate(nivell_equip = case_when(
+    equip %in% c("Real Madrid", "Barcelona", "Atlético de Madrid", "Athletic Club") ~ "gran",
+    
+    equip %in% c("Real Sociedad", "Real Betis", "Villarreal", "Valencia", 
+                 "Sevilla", "Celta de Vigo", "Girona", "Espanyol") ~ "mitja",
+    
+    equip %in% c("Rayo Vallecano", "Almería", "Granada", "Osasuna",
+                 "Getafe", "Mallorca", "Las Palmas", "Cádiz",
+                 "CD Leganés", "Real Valladolid",
+                 "Deportivo Alavés") ~ "petit"
+  ))
+
+cards_all$nivell_equip <- as.factor(cards_all$nivell_equip)
+```
+
+```{r}
+tab_tipustargeta_equip2 <- table(cards_all$nivell_equip, cards_all$tipus_targeta)
+chisq.test(tab_tipustargeta_equip2)
+```
+
+## Tipologia de targeta i nombre de gols
+
+```{r}
+partits_targetes <- cards_all %>%
+  group_by(url) %>%
+  summarise(
+    gols_local = first(gols_local),
+    gols_visitant = first(gols_visitant),
+    gols_total = first(gols_total),
+    
+    # TARGETES LOCAL
+    groga_local = sum(tipus_targeta == "groga" & local_visitant == "local"),
+    vermella_local = sum(tipus_targeta == "vermella" & local_visitant == "local"),
+    segona_groga_local = sum(tipus_targeta == "segona_groga" & local_visitant == "local"),
+    
+    # TARGETES VISITANT
+    groga_visitant = sum(tipus_targeta == "groga" & local_visitant == "visitant"),
+    vermella_visitant = sum(tipus_targeta == "vermella" & local_visitant == "visitant"),
+    segona_groga_visitant = sum(tipus_targeta == "segona_groga" & local_visitant == "visitant"),
+    
+    groga_total = groga_local+groga_visitant,
+    segona_groga_total = segona_groga_local+segona_groga_visitant,
+    vermella_total = vermella_local+vermella_visitant,
+    
+    .groups = "drop"
+  )
+```
+
+```{r}
+cat("Grogues:")
+cor.test(partits_targetes$gols_total, partits_targetes$groga_total, method = "spearman",
+  exact = FALSE)
+cat("Segones grogues:")
+cor.test(partits_targetes$gols_total, partits_targetes$segona_groga_total, method = "spearman",
+  exact = FALSE)
+cat("Vermelles:")
+cor.test(partits_targetes$gols_total, partits_targetes$vermella_total, method = "spearman",
+  exact = FALSE)
+```
+
+
+```{r}
+par(mfrow = c(1, 3))
+
+plot(partits_targetes$gols_total, partits_targetes$groga_total, xlab = "Nombre de gols", ylab = "Targetes grogues")
+plot(partits_targetes$gols_total, partits_targetes$segona_groga_total, xlab = "Nombre de gols", ylab = "Segones grogues")
+plot(partits_targetes$gols_total, partits_targetes$vermella_total, xlab = "Nombre de gols",ylab = "Targetes vermelles")
+```
+
+
+## Àrbitre i equip
+
+```{r}
+tab_equip_arbitre <- table(cards_all$codi_arbitre, cards_all$nivell_equip)
+chisq.test(tab_equip_arbitre)
+```
+
+```{r, fig.width=12, fig.height=6}
+ggplot(cards_all, aes(x = codi_arbitre, fill = nivell_equip)) +
+  geom_bar(position = "fill")
+```
+
+```{r}
+# num. targetes per arbitre i equup
+cards_arb_equip <- cards_all %>%
+  group_by(codi_arbitre, equip) %>%
+  summarise(n_cards = n(), .groups = "drop")
+
+# num. de partits
+partits_arb_equip <- cards_all %>%
+  distinct(url, codi_arbitre, equip) %>%
+  group_by(codi_arbitre, equip) %>%
+  summarise(n_partits = n(), .groups = "drop")
+
+# taxa
+taxa_arb_equip <- cards_arb_equip %>%
+  left_join(partits_arb_equip, by = c("codi_arbitre", "equip")) %>%
+  mutate(taxa_cards = n_cards / n_partits)
+```
+
+```{r}
+ggplot(taxa_arb_equip, aes(x = codi_arbitre, y = equip, fill = taxa_cards)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(
+    title = "Taxa de targetes per àrbitre i equip",
+    x = "Àrbitre", y = "Equip", fill = "Targetes/partit"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+assocstats(tab_equip_arbitre)
+```
+
+## Àrbitre i local/visitant
+
+```{r}
+df_partits_arbitre <- cards_all %>%
+  group_by(url, codi_arbitre) %>%
+  summarise(
+    targetes_local = sum(local_visitant == "local", na.rm = TRUE),
+    targetes_visitant = sum(local_visitant == "visitant", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(diff_targetes = targetes_local - targetes_visitant)
+```
+
+```{r}
+ggplot(df_partits_arbitre, aes(x = reorder(codi_arbitre, diff_targetes), y = diff_targetes)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Distribució de la diferència de targetes per àrbitre", x = "Àrbitre", y = "Targetes local - targetes visitant")
+```
+
+```{r}
+resultats_tests <- df_partits_arbitre %>%
+  group_by(codi_arbitre) %>%
+  summarise(
+    p_value = wilcox.test(diff_targetes, mu = 0)$p.value,
+    mediana = median(diff_targetes),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+resultats_tests
+```
+
+## Equip i equip receptor
+
+```{r}
+cards_all <- cards_all %>%
+  mutate(nivell_equip_rebut = case_when(
+    equip_rebut %in% c("Real Madrid", "Barcelona", "Atlético de Madrid", "Athletic Club") ~ "gran",
+    
+    equip_rebut %in% c("Real Sociedad", "Real Betis", "Villarreal", "Valencia", 
+                 "Sevilla", "Celta de Vigo", "Girona", "Espanyol") ~ "mitja",
+    
+    equip_rebut %in% c("Rayo Vallecano", "Almería", "Granada", "Osasuna",
+                 "Getafe", "Mallorca", "Las Palmas", "Cádiz",
+                 "CD Leganés", "Real Valladolid",
+                 "Deportivo Alavés") ~ "petit"
+  ))
+```
+
+```{r}
+partits_nivell <- cards_all %>%
+  group_by(url, nivell_equip, nivell_equip_rebut) %>%
+  summarise(n_cards = n(), .groups = "drop")
+
+tab_equip_equipreb <- table(partits_nivell$nivell_equip, partits_nivell$nivell_equip_rebut)
+
+taula_mitjanes <- partits_nivell %>%
+  group_by(nivell_equip, nivell_equip_rebut) %>%
+  summarise(
+    mean_targetes = mean(n_cards),
+    n_partits = n(),
+    .groups = "drop"
+  )
+taula_mitjanes
+```
+
+```{r}
+ggplot(taula_mitjanes,
+       aes(x = nivell_equip_rebut, y = nivell_equip, fill = mean_targetes)) +
+  geom_tile() +
+  geom_text(aes(label = round(mean_targetes, 2))) +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(x = "Nivell equip receptor", y = "Nivell equip que comet la targeta", fill = "Mitjana targetes per partit")
+```
+
+
+## Equip i local/visitant
+
+```{r}
+cards_partit_equip <- cards_all %>%
+  group_by(url, equip, local_visitant) %>%
+  summarise(n_targetes = n(), .groups = "drop")
+
+resum_equip_localvisitant <- cards_partit_equip %>%
+  group_by(equip, local_visitant) %>%
+  summarise(
+    mean_targetes = mean(n_targetes),
+    .groups = "drop"
+  )
+
+dif_equip_localvisitant <- resum_equip_localvisitant %>%
+  pivot_wider(
+    names_from = local_visitant,
+    values_from = mean_targetes
+  ) %>%
+  mutate(
+    diferencia = local - visitant
+  )
+```
+
+Test de Wilcoxon:
+```{r}
+resultats_wilcox <- cards_partit_equip %>%
+  group_by(equip) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(n_targetes ~ local_visitant)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adjust = p.adjust(p_value, method = "BH")
+  )
+resultats_wilcox
+```
+
+Gràfic:
+```{r}
+ggplot(dif_equip_localvisitant,
+       aes(x = reorder(equip, diferencia), 
+           y = diferencia, 
+           fill = diferencia > 0)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(
+    values = c("TRUE" = "#2E86C1", "FALSE" = "#E74C3C"),
+    labels = c("FALSE" = "Més targetes com a visitant",
+               "TRUE" = "Més targetes com a local"),
+    name = ""
+  ) +
+  labs( title = "Diferència en la mitjana de targetes per partit segons si és local o visitant", x = "Equip", y = "Diferència (local - visitant)" ) 
+```
+
+
+## Equip i resultat
+
+Test Kruskal-Wallis
+
+```{r}
+cards_partit_resultat <- cards_all %>%
+  group_by(url, equip, resultat_equip) %>%
+  summarise(n_targetes = n(), .groups = "drop")
+
+resultats_kw <- cards_partit_resultat %>%
+  group_by(equip) %>%
+  summarise(p_value = kruskal.test(n_targetes ~ resultat_equip)$p.value) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+resultats_kw
+```
+
+Graficar:
+```{r}
+resum_equip_resultat <- cards_partit_resultat %>%
+  group_by(equip, resultat_equip) %>%
+  summarise(
+    n_partits = n(),
+    mean_targetes = mean(n_targetes),
+    mediana_targetes = median(n_targetes),
+    sd_targetes = sd(n_targetes),
+    minim = min(n_targetes),
+    maxim = max(n_targetes),
+    .groups = "drop")
+```
+
+```{r}
+ggplot(resum_equip_resultat, aes(x = resultat_equip, y = mean_targetes, group = equip)) +
+  geom_line(alpha = 0.4) +
+  geom_point(size = 2) +
+  facet_wrap(~ equip) +
+  labs(x = "Resultat", y = "Mitjana de targetes per partit"
+       ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# ANÀLISI MULTIVARIANT
+
+## Nova estructura de dades
+
+```{r}
+taula_model <- cards_all %>%
+  group_by(
+    url, jornada, codi_arbitre, equip, nivell_equip, equip_rebut, nivell_equip_rebut,
+    local_visitant, resultat_equip, gols_local, gols_visitant
+  ) %>%
+  summarise(
+    n_targetes = n(),
+    n_groga = sum(tipus_targeta == "groga", na.rm = TRUE),
+    n_segona_groga = sum(tipus_targeta == "segona_groga", na.rm = TRUE),
+    n_vermella = sum(tipus_targeta == "vermella", na.rm = TRUE),
+    .groups = "drop")
+
+taula_model <- taula_model %>%
+  rename(
+    equip_sancionat = equip,
+    nivell_equip_sancionat = nivell_equip,)
+```
+
+## Construcció del model
+
+### Poisson sense efectes aleatoris
+```{r}
+model_pois <- glm(
+  n_targetes ~ codi_arbitre + local_visitant + nivell_equip_sancionat + resultat_equip,
+  family = poisson(link = "log"),
+  data = taula_model)
+```
+
+### Models Poisson amb efectes aleatoris
+
+```{r}
+# Model nomes amb equip sancionat
+model_pois2 <- glmer(
+  n_targetes ~ codi_arbitre + local_visitant + nivell_equip_sancionat + nivell_equip_rebut + resultat_equip + (1|equip_sancionat),
+  family = poisson(link = "log"), data = taula_model)
+
+# Model amb equip sancionat i rebut
+model_pois3 <- glmer(
+  n_targetes ~ codi_arbitre + local_visitant + nivell_equip_sancionat + nivell_equip_rebut + resultat_equip + (1|equip_sancionat) + (1|equip_rebut),
+  family = poisson(link = "log"), data = taula_model)
+```
+
+Comparació de models:
+```{r}
+lrtest(model_pois, model_pois2,model_pois3)
+```
+
+S'escull el model 2
+
+```{r}
+summary(model_pois2)
+```
+
+### Efecte de la variable d'efecte aleatori
+
+```{r}
+dotplot(ranef(model_pois2))
+```
+
+```{r}
+(ordre_sancionat<-ranef(model_pois2))
+
+taula_efectes <- data.frame(
+  Equip = rownames(ordre_sancionat$equip_sancionat),
+  Efecte = ordre_sancionat$equip_sancionat[,1]
+) |>
+  arrange(Efecte) |>
+  mutate(Efecte = round(Efecte, 4))
+```
+
+### Efecte de la variable fixa nivell_equip_sancionat
+
+```{r}
+emm_nivell_equip_sancionat <- emmeans(model_pois2, ~ nivell_equip_sancionat)
+pairs(emm_nivell_equip_sancionat)
+```
+
+### Efecte de la variable fixa nivell_equip_rebut
+
+```{r}
+emm_nivell_equip_rebut <- emmeans(model_pois2, ~ nivell_equip_rebut)
+pairs(emm_nivell_equip_rebut)
+```
+### Efecte de la variable fixa resultat_partit
+
+```{r}
+emm_resultat_equip <- emmeans(model_pois2, ~ resultat_equip)
+pairs(emm_resultat_equip)
+```
+
+### Efecte de la variable fixa àrbitre
+
+Es volen fer els contrastos entre àrbitres
+```{r}
+emm_arbitres <- emmeans(model_pois2, ~ codi_arbitre)
+pairs(emm_arbitres, adjust = "BH") #fiquem les correccions perque son moltes comparacions
+```
+
+Combinacions significatives:
+```{r}
+(res <- pairs(emm_arbitres, adjust = "BH") %>% as.data.frame() %>% filter(p.value < 0.05))
+```
+
+## Validació
+
+### Validació numèrica
+
+Deviancia:
+```{r}
+cat("Deviància:")
+deviance(model_pois2)
+cat("Graus de llibertat:")
+df.residual(model_pois2)
+
+deviance_ratio <-deviance(model_pois2)/df.residual(model_pois2)
+cat("Ràtio Deviància/g.ll.:")
+deviance_ratio
+```
+
+```{r}
+taula_deviancia <- data.frame(
+  Indicador = c("Deviància residual", "Graus de llibertat", "Ràtio Deviància/g.l."),
+  Valor = c(deviance(model_pois2), df.residual(model_pois2), deviance(model_pois2) / df.residual(model_pois2)))
+```
+
+Estadístic de Pearson:
+```{r}
+pearson_res <- residuals(model_pois2, type = "pearson")
+pearson_stat <- sum(pearson_res^2)
+df <- df.residual(model_pois2)
+
+pearson_ratio <- pearson_stat / df
+cat("Estadístic de Pearson/g.ll.:")
+pearson_ratio
+```
+
+### Validació gràfica
+
+```{r}
+valors_ajustats <- fitted(model_pois2)
+
+plot(valors_ajustats, pearson_res, xlab = "Valors ajustats", ylab = "Residus de Pearson", main = "Residus vs valors ajustats", pch = 19)
+
+# Línia de tendència
+lines(lowess(valors_ajustats, pearson_res), col = "red", lwd = 2)
+```
+
+Punts amb residus elevats:
+```{r}
+# residus on >= 3
+idx_residus_alts <- which(pearson_res >= 3)
+
+# Observacions:
+(info_residus_alts<-taula_model[idx_residus_alts, ])
+```
+
+#### Residus vs vars. explicatives
+
+S'afegeixen els residus a la taula:
+```{r}
+taula_model$residus <- residuals(model_pois2, type = "pearson")
+```
+
+```{r}
+boxplot(residus ~ factor(local_visitant, levels = c("local", "visitant")),
+        data = taula_model,
+        xlab = "Local/visitant",
+        ylab = "Residus de Pearson",
+        main = "Residus segons si l'equip sancionat és local o visitant")
+abline(h = 0, col = "red", lty = 2)
+
+boxplot(residus ~ resultat_equip,
+        data = taula_model,
+        xlab = "Resultat",
+        ylab = "Residus de Pearson",
+        main = "Residus segons el resultat")
+abline(h = 0, col = "red", lty = 2)
+
+boxplot(residus ~ nivell_equip_sancionat,
+        data = taula_model,
+        xlab = "Nivell equip sancionat",
+        ylab = "Residus de Pearson",
+        main = "Residus segons el nivell de l'equip sancionat")
+abline(h = 0, col = "red", lty = 2)
+
+boxplot(residus ~ nivell_equip_rebut,
+        data = taula_model,
+        xlab = "Nivell equip rebut",
+        ylab = "Residus de Pearson",
+        main = "Residus segons el nivell de l'equip rival")
+abline(h = 0, col = "red", lty = 2)
+```
+
+#### Normalitat de l'efecte aleatori
+
+```{r}
+ranef_vals <- ranef(model_pois2)$equip_sancionat[,1]
+
+qqnorm(ranef_vals)
+qqline(ranef_vals, col = "red")
+```
+
+#### Valors atípics
+
+```{r}
+sim_res <- simulateResiduals(model_pois2, plot = TRUE)  # residus simulats del model  
+testOutliers(sim_res, type = "bootstrap") # test d'outlliers
+```
+
+
+## Predicció
+
+Predicció del nombre de targetes d'un equip en un partit:
+```{r}
+nou_partit <- data.frame(codi_arbitre = "JAR", nivell_equip_sancionat = "gran", nivell_equip_rebut = "petit", local_visitant = "local", resultat_equip = "victoria" , equip_sancionat = "Barcelona")
+
+predict(model_pois2, newdata = nou_partit, type = "response")  #retorna ja el valor havent aplicat l'exponencial, es a dir, en l'escala original, tal qual s'interpreta, retorna el numero de targetes esperades
+```
+
+Predicció de tots els partits
+```{r}
+taula_model$pred<-predict(model_pois2, type = "response")
+```
+
+```{r}
+set.seed(123)  
+taula_annex <- taula_model %>%
+  mutate(
+    pred = predict(model_pois2, type = "response"),
+    residu = n_targetes - pred
+  ) %>%
+  select(equip_sancionat, n_targetes, pred, residu) %>%
+  slice_sample(n = 20)
+```
+
+### Avaluació de la capacitat predictiva
+
+Es fa la validació LOGO (leave-one-group-out).
+
+```{r}
+equips <- unique(taula_model$equip_sancionat) # vector amb els equips
+
+resultats_logo <- data.frame()  # s'emmagatzemaran els resultats
+warnings_logo <- data.frame()  # es guarda el model que no convergeixi
+
+# per a cada equip del vector, fa el seguent proces
+for (eq in equips) {
+  
+  train <- taula_model %>% filter(equip_sancionat != eq)  # mostra SENSE l'equip seleccionat
+  test  <- taula_model %>% filter(equip_sancionat == eq)  # mostra AMB l'equip seleccionat
+  
+  warn_msg <- NULL
+  
+# s'ajusta el model sense l'equip en questio  
+  model_logo <- withCallingHandlers(
+    glmer( n_targetes ~ codi_arbitre + local_visitant + nivell_equip_sancionat + nivell_equip_rebut +   resultat_equip + (1 | equip_sancionat),
+      family = poisson(link = "log"), data = train, 
+      control = glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5))),
+    warning = function(w) {
+      warn_msg <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    }
+  )
+  
+  # guarda els warnings si n'hi ha hagut
+  if (!is.null(warn_msg)) {
+    warnings_logo <- rbind(
+      warnings_logo,
+      data.frame(equip_exclos = eq, warning = warn_msg))
+  }
+  
+  # es fan les prediccions del nou equip, sense utilitzar els efectes aleatoris
+  pred <- predict(model_logo, newdata = test, type = "response", re.form = NA)
+  
+  # es construeix taula amb l'equip sancionat, el valor observat i el predit
+  resultats_logo <- rbind(resultats_logo,
+    data.frame(equip_sancionat = eq, observat = test$n_targetes, predit = pred))
+}
+
+resultats_logo
+```
+
+Mètriques:
+```{r}
+RMSE_logo <- sqrt(mean((resultats_logo$observat - resultats_logo$predit)^2))
+MAE_logo <- mean(abs(resultats_logo$observat - resultats_logo$predit))
+
+RMSE_logo
+MAE_logo
+```
+
+Gràfic de valors predits vs observats:
+```{r}
+ggplot(resultats_logo, aes(x = predit, y = observat)) +
+  
+  geom_point(alpha = 0.4) +
+  
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  
+  scale_y_continuous(
+    breaks = seq(
+      floor(min(resultats_logo$observat)),
+      ceiling(max(resultats_logo$observat)),
+      by = 1)
+  ) +
+  labs(x = "Nombre de targetes predit", y = "Nombre de targetes observat")
+```
+
