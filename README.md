@@ -11,7 +11,10 @@ L'estudi es basa en dades obtingudes mitjançant un procés de web scraping a pa
 ## Estructura del repositori
 
 - `annexos/`: scripts utilitzats per a l'extracció i preparació de les dades, així com les anàlisis descriptives, bivariants i la modelització estadística.
-- `data/`: bases de dades creades en el web scraping i emprades en l'estudi.
+- `cards2324/`: informació de les targetes per a la temporada 23-24.
+- `cards2425/`: informació de les targetes per a la temporada 24-25.
+- `cards_all/`: base de dades final creada en el web scraping (combinació de les dues temporades) i emprada en l'estudi.
+- `taula_model/`: dataset utilitzat per a construir el model.
   
 ## Metodologia
 
